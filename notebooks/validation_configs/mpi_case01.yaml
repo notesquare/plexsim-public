@@ -1,0 +1,41 @@
+environment:
+  coordinate_system: cartesian
+  grid_shape: [3, 5, 4]
+  cell_size: [1.e-2, 1.e-2, 1.e-2]
+  external_magnetic_field: [0, 0, 0]  # array or file.csv
+  external_electric_field: [0, 0, 0]
+
+grids:
+  # -
+  #   species: {electron, ion}
+  #   backend: {cpu, gpu}
+  #   n_splits: [2, 2, 1] or null
+  #   n_computational_to_physical: 1.e+3
+  #   initial_condition:
+  #     sample: {random, normal, _filepath_}
+  #     n_particles: 1.e+2
+  #     avg_velocity: 6.e-12
+  #     tracking:
+  #       n_particles: 10
+  #       sample: random
+  -
+    species: electron
+    backend: gpu
+    n_splits: [2, 2, 1]
+    n_computational_to_physical: 1.e+3
+    initial_condition:
+      sample: case_01
+      n_particles: 1.e+2
+      avg_velocity: 0.e-0
+
+simulation:
+  delta_time: 1.e-11
+  n_cycles: 200
+
+  backend: mpi
+
+  filepath: ./mpi_case01.h5
+  checkpoint_strategy:
+    save_particles_frequency: 10
+    save_field_frequency: 1
+    save_tracked_frequency: 1
