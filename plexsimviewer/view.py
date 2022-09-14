@@ -34,6 +34,8 @@ class H5Viewer:
 
                 for cycle in sorted(h5f['cycles'], key=int)[:-1]:
                     base_path = f'cycles/{cycle}/grids/{grid_index}/tracked'
+                    if base_path not in h5f:
+                        continue
                     Xs = h5f[f'{base_path}/X'][:]
                     Us = h5f[f'{base_path}/U'][:]
                     ids = h5f[base_path].attrs['tracking_ids']
@@ -70,6 +72,8 @@ class H5Viewer:
     def builds_frames(self):
         frames = []
         for cycle in self.all_cycles:
+            if cycle not in self.trajectory_by_cycle:
+                continue
             grid_data = self.trajectory_by_cycle[cycle]
             frame_data = []
             for grid_key, particles in grid_data.items():
