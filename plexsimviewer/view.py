@@ -1,88 +1,131 @@
+import os
+import re
+from pathlib import Path
+
 import h5py
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
+
+COLORS = px.colors.qualitative.Plotly
 
 
 class H5Viewer:
-    def __init__(self, fp):
-        all_particles_by_grid = {}
-        all_cycles = set()
+    def __init__(self, fp, cycles=None):
+        fp = Path(fp)
+
+        self.all_particles_by_grid = {}
+        self.trajectory_by_grid = {}  # key: particle_name
+        self.trajectory_by_cycle = {}
+        # key: cycle, value: { particle_name: particles }
+        self.stats_by_cycle = {}  # key: cycle, value: stats
+        self.particle_name_by_grid_index = {}
 
         with h5py.File(fp, 'r') as h5f:
-            shape = h5f['settings/environment'].attrs['grid_shape']
-            cell_size = h5f['settings/environment'].attrs['cell_size']
-            trajectory_by_grid = {}  # key: (grid_index, species)
-            trajectory_by_cycle = {}  # key: cycle, value: { grid: particles }
-            stats_by_cycle = {}  # key: cycle, value: n_particles, total_E
-            for cycle in sorted(h5f['cycles'], key=int)[:-1]:
-                cycle = int(cycle)
-                stats = dict(h5f[f'cycles/{cycle}/stats'].attrs)
-                n_particles = stats['n_particles']
-                total_E = stats['total_E']
-                stats_by_cycle[cycle] = dict(n_particles=n_particles,
-                                             total_E=total_E)
+            iteration_encoding = h5f.attrs['iterationEncoding'].decode()
+            iteration_format = h5f.attrs['iterationFormat'].decode()
+            self.grid_shape = h5f['settings'].attrs['grid_shape']
+            self.cell_size = h5f['settings'].attrs['cell_size']
 
-            for grid_index in sorted(h5f['settings/grids'], key=int):
-                grid_index = int(grid_index)
-                species = h5f[f'settings/grids/{grid_index}'].attrs['species']
-                t_key = (grid_index, species)
-
-                all_particles_by_grid.setdefault(grid_index, set())
-                trajectory_by_grid[t_key] = {}
-                particles_by_cycles = trajectory_by_grid[t_key]
-
-                for cycle in sorted(h5f['cycles'], key=int)[:-1]:
-                    base_path = f'cycles/{cycle}/grids/{grid_index}/tracked'
-                    if base_path not in h5f:
+        if iteration_encoding == 'fileBased':
+            if cycles is None:
+                files = []
+                for filename in os.listdir(fp.parent):
+                    p = re.compile(iteration_format.replace('%T', r'(\d+)'))
+                    m = p.match(filename)
+                    if not m:
                         continue
-                    Xs = h5f[f'{base_path}/X'][:]
-                    Us = h5f[f'{base_path}/U'][:]
-                    ids = h5f[base_path].attrs['tracking_ids']
+                    cycle = m.group(1)
+                    files.append(re.sub('%T', cycle,
+                                 f'{fp.parent}/{iteration_format}'))
+            else:
+                files = [
+                    re.sub('%T', str(cycle), f'{fp.parent}/{iteration_format}')
+                    for cycle in cycles
+                ]
+            self.collect_data_filebased(files)
 
-                    if Xs is None:
-                        continue
-                    cycle = int(cycle)
+        elif iteration_encoding == 'groupBased':
+            self.collect_data_groupbased(fp, cycles)
 
-                    all_cycles.add(cycle)
-
-                    particles = {}
-                    particles_by_cycles.setdefault(cycle, {})
-                    for _id, X, U in zip(ids, Xs, Us):
-                        all_particles_by_grid[grid_index].add(_id)
-                        particles[_id] = (X * cell_size, U)
-
-                    particles_by_cycles[cycle] = particles
-
-                    trajectory_by_cycle.setdefault(cycle, {})
-                    trajectory_by_cycle[cycle][t_key] = particles
-
-        self.grid_shape = shape
-        self.cell_size = cell_size
-        self.trajectory_by_grid = trajectory_by_grid
-        self.trajectory_by_cycle = trajectory_by_cycle
-        self.stats_by_cycle = stats_by_cycle
-
-        # sort often-used items
-        self.all_cycles = sorted(all_cycles)
         self.all_particles_by_grid = {
-            k: sorted(v) for k, v in all_particles_by_grid.items()
+            k: sorted(v) for k, v in self.all_particles_by_grid.items()
         }
+
+        self.figure_tracked = None
+        self.figure_stats = None
+
+    def collect_cycle_data(self, h5f, cycle):
+        self.stats_by_cycle[cycle] = dict(h5f[f'data/{cycle}/stats'].attrs)
+        self.trajectory_by_cycle.setdefault(cycle, {})
+        for particle_name in self.particle_name_by_grid_index.values():
+            _particle_name = particle_name + '_tracked'
+            self.trajectory_by_cycle[cycle].setdefault(_particle_name, {})
+
+        _path = f'data/{cycle}/particles'
+        for particle_name in h5f[_path]:
+            particle_group = h5f[f'{_path}/{particle_name}']
+            if particle_group.attrs['_tracked'] != 1:
+                continue
+
+            grid_index = particle_group.attrs['_gridIndex']
+            if grid_index not in self.particle_name_by_grid_index:
+                _particle_name = particle_name.split('_tracked')[0]
+                self.particle_name_by_grid_index[grid_index] = _particle_name
+
+            self.all_particles_by_grid.setdefault(particle_name, set())
+            self.trajectory_by_grid.setdefault(particle_name, dict())
+            particles_by_cycles = self.trajectory_by_grid[particle_name]
+
+            ids = particle_group['id'][:]
+            if len(ids) == 0:
+                continue
+
+            axis_labels = ['x', 'y', 'z']
+            Xs = np.stack([
+                particle_group[f'position/{axis}'][:]
+                for axis in axis_labels
+            ], axis=-1)
+            Us = np.stack([
+                particle_group[f'momentum/{axis}'][:]
+                for axis in axis_labels
+            ], axis=-1)
+
+            particles = {}
+            particles_by_cycles.setdefault(cycle, dict())
+            for _id, X, U in zip(ids, Xs, Us):
+                _id = int(_id)
+                self.all_particles_by_grid[particle_name].add(_id)
+                particles[_id] = (X * self.cell_size, U)
+
+            particles_by_cycles[cycle] = particles
+
+            self.trajectory_by_cycle[cycle][particle_name] = particles
+
+    def collect_data_filebased(self, files):
+        for fp in files:
+            with h5py.File(fp, 'r') as h5f:
+                cycle = int(set(h5f['data']).pop())
+                self.collect_cycle_data(h5f, cycle)
+
+    def collect_data_groupbased(self, fp, cycles=None):
+        with h5py.File(fp, 'r') as h5f:
+            for cycle in h5f['data']:
+                cycle = int(cycle)
+                if cycles is not None and cycle not in cycles:
+                    continue
+                self.collect_cycle_data(h5f, cycle)
 
     def builds_frames(self):
         frames = []
-        for cycle in self.all_cycles:
-            if cycle not in self.trajectory_by_cycle:
-                continue
-            grid_data = self.trajectory_by_cycle[cycle]
+        for cycle, grid_data in sorted(self.trajectory_by_cycle.items()):
             frame_data = []
-            for grid_key, particles in grid_data.items():
-                grid_index, species = grid_key
 
-                p_ids = self.all_particles_by_grid[grid_index]
+            for particle_name, particles in grid_data.items():
+                p_ids = self.all_particles_by_grid[particle_name]
 
                 for p_id in p_ids:
-
                     if p_id not in particles:
                         x = None
                         y = None
@@ -93,49 +136,33 @@ class H5Viewer:
                         y = X[1]
                         z = X[2]
 
-                    legend_text = f'Grid {grid_index} ({species})'
+                    color = COLORS[p_id % len(COLORS)]
                     frame_data.append(
                         go.Scatter3d(
                             x=[x], y=[y], z=[z],
-                            legendgroup=f'g{grid_index}',
-                            legendgrouptitle_text=legend_text,
+                            legendgroup=particle_name,
+                            legendgrouptitle_text=particle_name,
                             mode='markers',
+                            marker=dict(color=color),
                             name=f'Particle {p_id}',
-                            marker=dict(
-                                symbol='circle' if species ==
-                                        'electron' else 'square'),
                             opacity=0.8
                         )
                     )
-
-            n_traces = len(frame_data)
-            n_particles = self.stats_by_cycle[cycle]['n_particles']
-            total_E = self.stats_by_cycle[cycle]['total_E']
-
-            frame_data += [go.Scatter(x=[cycle], y=[n_particles]),
-                           go.Scatter(x=[cycle], y=[total_E])]
-            traces = [i for i in range(n_traces)]\
-                + [n_traces * 2 + i for i in range(2)]
-            title_text = f'Particles: {n_particles} / Energy {total_E} [J]'
-            layout = go.Layout(title_text=title_text)
-            frames.append(dict(data=frame_data, name=f'Cycle {cycle}',
-                               traces=traces, layout=layout))
+            frames.append(dict(data=frame_data, name=f'Cycle {cycle}'))
         return frames
 
     def build_traces(self):
         data = []
-        for key, particles_by_cycles in self.trajectory_by_grid.items():
-            grid_index, species = key
+        for particle_name, particles_by_cycles\
+                in self.trajectory_by_grid.items():
 
-            p_ids = self.all_particles_by_grid[grid_index]
-
+            p_ids = self.all_particles_by_grid[particle_name]
             for p_id in p_ids:
                 x = []
                 y = []
                 z = []
 
-                for cycle in self.all_cycles:
-                    particles = particles_by_cycles[cycle]
+                for cycle, particles in sorted(particles_by_cycles.items()):
                     if p_id not in particles:
                         continue
 
@@ -144,19 +171,21 @@ class H5Viewer:
                     y.append(X[1])
                     z.append(X[2])
 
+                color = COLORS[p_id % len(COLORS)]
                 data.append(
                     go.Scatter3d(
                         x=x, y=y, z=z,
-                        legendgroup=f'g{grid_index}',
+                        legendgroup=particle_name,
                         mode='lines',
+                        line=dict(color=color),
+                        name=f'Particle {p_id}',
                         opacity=0.3,
                         showlegend=False
                     )
                 )
         return data
 
-    @property
-    def figure(self):
+    def build_figure_tracked(self):
         def frame_args(duration):
             return {
                 'frame': {'duration': duration},
@@ -178,59 +207,21 @@ class H5Viewer:
             'steps': [
                 {
                     'args': [[f['name']], frame_args(0)],
-                    'label': f'{k}',
+                    'label': f['name'].split(' ')[-1],
                     'method': 'animate',
                 }
-                for k, f in enumerate(frames)
+                for f in frames
             ]
         }]
 
-        fig = make_subplots(rows=2, cols=1,
-                            row_heights=[0.8, 0.2],
-                            specs=[[{'type': 'scene'}],
-                                   [{'type': 'xy', 'secondary_y': True}]])
-        fig.frames = frames
-
-        # add trajectory traces
-        fig.add_traces([*frames[0]['data'][:-2], *self.build_traces()],
-                       rows=1, cols=1)
-
-        # add stats graph
-        n_particles_arr = np.array([stat['n_particles'] for stat
-                                    in self.stats_by_cycle.values()])
-        total_E_arr = np.array([stat['total_E'] for stat
-                                in self.stats_by_cycle.values()])
-        fig.add_trace(go.Scatter(y=[n_particles_arr[0]],
-                                 name='n_particles',
-                                 marker=dict(color='red'),
-                                 showlegend=False),
-                      row=2, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(y=[total_E_arr[0]],
-                                 name='total_E',
-                                 marker=dict(color='blue'),
-                                 showlegend=False),
-                      row=2, col=1, secondary_y=True)
-        fig.add_trace(go.Scatter(y=n_particles_arr,
-                                 name='n_particles',
-                                 marker=dict(color='red'),
-                                 showlegend=True),
-                      row=2, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(y=total_E_arr,
-                                 name='total_E',
-                                 marker=dict(color='blue'),
-                                 showlegend=True),
-                      row=2, col=1, secondary_y=True)
+        fig = go.Figure(
+            data=[*frames[0]['data'], *self.build_traces()],
+            frames=frames)
 
         grid_shape = self.grid_shape
         cell_size = self.cell_size
         grid_size = grid_shape * cell_size
         fig.update_layout(
-            title={
-                'text': fig.frames[0].layout.title.text,
-                'font': {'size': 12},
-                'pad': {'t': 10, 'b': 10},
-                'xanchor': 'left',
-                'y': 0.3},
             height=800,
             scene=dict(
                 xaxis=dict(dtick=cell_size[0], range=[0, grid_size[0]]),
@@ -242,8 +233,7 @@ class H5Viewer:
                                  y=grid_shape[1] / grid_shape.max(),
                                  z=grid_shape[2] / grid_shape.max())
             ),
-            margin=dict(t=20, b=0, l=0, r=0),
-            legend=dict(groupclick='toggleitem', x=1.1),
+            margin=dict(t=0, b=0, l=0, r=0),
             updatemenus=[{
                 'buttons': [
                     {
@@ -264,10 +254,71 @@ class H5Viewer:
                 'y': 0,
             }],
             sliders=sliders,
-            yaxis=dict(title_text='n_particles', exponentformat='SI'),
-            yaxis2=dict(title_text='total_E', exponentformat='SI')
         )
-        return fig
+        self.figure_tracked = fig
+
+    @property
+    def tracked(self):
+        if self.figure_tracked is None:
+            self.build_figure_tracked()
+        self.figure_tracked._ipython_display_()
 
     def _ipython_display_(self):
-        self.figure._ipython_display_()
+        self.tracked
+
+    def build_figure_stats(self):
+        stats = sorted(list(self.stats_by_cycle.items()))
+        cycles = [cycle for cycle, _ in stats]
+        kinetic_E = {
+            particle_name: [v['kinetic_E'][grid_index] for _, v in stats]
+            for grid_index, particle_name
+            in self.particle_name_by_grid_index.items()
+        }
+        n_particles = {
+            particle_name: [v['n_particles'][grid_index] for _, v in stats]
+            for grid_index, particle_name
+            in self.particle_name_by_grid_index.items()
+        }
+
+        fig = make_subplots(specs=[[{'secondary_y': True}]])
+
+        [fig.add_trace(go.Scatter(
+            x=cycles,
+            y=[v[stat] for _, v in stats],
+            name=stat,
+            legendgroup='Field Energy'))
+         for stat in ['electric_E', 'magnetic_E', 'total_E']]
+
+        [fig.add_trace(go.Scatter(
+            x=cycles,
+            y=value,
+            name=f'kinetic_E-{particle_name}',
+            legendgroup='Kinetic Energy'))
+         for particle_name, value in kinetic_E.items()]
+
+        [fig.add_trace(go.Scatter(
+            x=cycles,
+            y=value,
+            name=f'n_particles-{particle_name}',
+            legendgroup='n_particles'), secondary_y=True)
+         for particle_name, value in n_particles.items()]
+
+        fig.update_xaxes(title_text='Cycles')
+        fig.update_yaxes(title_text='Energy [J]',
+                         tickformat='.3e',
+                         secondary_y=False)
+        fig.update_yaxes(title_text='# of Particles', secondary_y=True)
+        fig.update_layout(title_text='Stats',
+                          legend=dict(orientation='h',
+                                      yanchor='bottom',
+                                      xanchor='right',
+                                      x=1,
+                                      y=1.02,
+                                      groupclick='toggleitem'))
+        self.figure_stats = fig
+
+    @property
+    def stats(self):
+        if self.figure_stats is None:
+            self.build_figure_stats()
+        self.figure_stats._ipython_display_()
